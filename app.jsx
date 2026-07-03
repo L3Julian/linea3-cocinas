@@ -1,0 +1,649 @@
+const { useState, useEffect, useRef } = React;
+
+const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxRH29fg7I_RCAU9VBakZP1jXj0P9JQkUd8EduRd4TqQiYvlddFXr-J1Cbe4nmUugYN/exec";
+
+const INITIAL_CONFIG = {
+  montadores: ["David","Alejandro","Beta","Carlos","Miguel","Javier"],
+  ayudantes:  ["Beta","Carlos","Miguel","Javier","David","Alejandro"],
+  medidores:  ["Alicia","Marta","Pedro","Luis"],
+  disenadoras:["Alicia","Marta","Sara","Elena"],
+};
+
+const TIPO_NOTA = {
+  montaje:   { label: "📦 Nota de Montaje",   color: "#2563eb" },
+  remate:    { label: "🔧 Nota de Remate",    color: "#d97706" },
+  postventa: { label: "🛠 Nota de Postventa", color: "#dc2626" },
+};
+
+const HEADERS = [
+  "id","tipo","fecha","cliente","direccion","visita",
+  "montador","ayudante","medidor","disenadora",
+  "materiales","observaciones","fotos","creado"
+];
+
+// ─── API helpers ──────────────────────────────────────────────────────────────
+async function fetchData() {
+  const res = await fetch(SCRIPT_URL);
+  const data = await res.json();
+  if (data.ok === false) throw new Error(data.error || "Error al cargar datos");
+  const rows = data.values || [];
+  let notas = [];
+  if (rows.length >= 2) {
+    const [, ...dataRows] = rows;
+    notas = dataRows.map(r => ({
+      id:            r[0]  || "",
+      tipo:          r[1]  || "montaje",
+      fecha:         r[2]  || "",
+      cliente:       r[3]  || "",
+      direccion:     r[4]  || "",
+      visita:        r[5]  || "1",
+      montador:      r[6]  || "",
+      ayudante:      r[7]  || "",
+      medidor:       r[8]  || "",
+      disenadora:    r[9]  || "",
+      materiales:    r[10] || "",
+      observaciones: r[11] || "",
+      fotos:         r[12] ? (() => { try { return JSON.parse(r[12]); } catch { return []; } })() : [],
+      creado:        r[13] || "",
+    }));
+  }
+  return { notas, config: data.config || null };
+}
+
+async function appendNota(nota) {
+  const row = HEADERS.map(h => {
+    const v = nota[h];
+    return h === "fotos" ? JSON.stringify(v || []) : String(v ?? "");
+  });
+  const res = await fetch(SCRIPT_URL, {
+    method: "POST",
+    body: JSON.stringify({ action: "append", row }),
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || "Error al guardar en el servidor");
+  return data;
+}
+
+async function deleteNota(id) {
+  const res = await fetch(SCRIPT_URL, {
+    method: "POST",
+    body: JSON.stringify({ action: "delete", id: String(id) }),
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || "Error al eliminar en el servidor");
+  return data;
+}
+
+async function saveConfigToServer(cfg) {
+  const res = await fetch(SCRIPT_URL, {
+    method: "POST",
+    body: JSON.stringify({ action: "saveConfig", config: cfg }),
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || "Error al guardar el equipo");
+  return data;
+}
+
+// Sube a Drive las fotos que aún no tengan url (solo tienen "data" en base64)
+async function uploadFotos(nota) {
+  const pendientes = (nota.fotos || []).filter(f => f.data && !f.url);
+  if (pendientes.length === 0) return nota.fotos || [];
+  const yaSubidas = (nota.fotos || []).filter(f => f.url);
+
+  const res = await fetch(SCRIPT_URL, {
+    method: "POST",
+    body: JSON.stringify({
+      action: "uploadFotos",
+      notaId: nota.id,
+      cliente: nota.cliente,
+      fecha: nota.fecha,
+      fotos: pendientes.map(f => ({ name: f.name, data: f.data })),
+    }),
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || "Error al subir las fotos");
+  return [...yaSubidas, ...data.urls];
+}
+
+// ─── Config: fuente de verdad = Sheet "Config", con caché local para modo offline ──
+function useServerConfig() {
+  const [cfg, setCfgState] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("l3_config_cache")) ?? INITIAL_CONFIG; }
+    catch { return INITIAL_CONFIG; }
+  });
+
+  const hydrate = (serverCfg) => {
+    setCfgState(serverCfg);
+    localStorage.setItem("l3_config_cache", JSON.stringify(serverCfg));
+  };
+
+  const update = (updater) => {
+    setCfgState(prev => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      localStorage.setItem("l3_config_cache", JSON.stringify(next));
+      saveConfigToServer(next).catch(() => {});
+      return next;
+    });
+  };
+
+  return [cfg, update, hydrate];
+}
+
+function today() { return new Date().toISOString().slice(0, 10); }
+
+function emptyNota(tipo) {
+  return {
+    id: Date.now(), tipo, fecha: today(),
+    cliente: "", direccion: "", visita: "1",
+    montador: "", ayudante: "", medidor: "", disenadora: "",
+    materiales: "", observaciones: "", fotos: [],
+    creado: new Date().toISOString(),
+  };
+}
+
+// ─── Components ───────────────────────────────────────────────────────────────
+function Badge({ tipo }) {
+  const t = TIPO_NOTA[tipo];
+  return (
+    <span style={{
+      background: t.color+"22", color: t.color,
+      border: `1px solid ${t.color}55`, borderRadius: 6,
+      padding: "2px 10px", fontSize: 12, fontWeight: 700
+    }}>{t.label}</span>
+  );
+}
+
+function SelectField({ label, value, onChange, options, onAddNew }) {
+  const [adding, setAdding] = useState(false);
+  const [nv, setNv] = useState("");
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <label style={S.label}>{label}</label>
+      <div style={{ display: "flex", gap: 6 }}>
+        <select value={value} onChange={e => onChange(e.target.value)} style={S.input}>
+          <option value="">— seleccionar —</option>
+          {options.map(o => <option key={o} value={o}>{o}</option>)}
+        </select>
+        <button onClick={() => setAdding(true)} style={S.btnSm}>＋</button>
+      </div>
+      {adding && (
+        <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+          <input placeholder="Nombre…" value={nv} onChange={e => setNv(e.target.value)}
+            style={{ ...S.input, flex: 1 }} />
+          <button style={S.btnSm} onClick={() => {
+            if (nv.trim()) { onAddNew(nv.trim()); onChange(nv.trim()); }
+            setNv(""); setAdding(false);
+          }}>✓</button>
+          <button style={{ ...S.btnSm, background: "#fee2e2", color: "#dc2626" }}
+            onClick={() => setAdding(false)}>✕</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FotoUpload({ fotos, onChange }) {
+  const ref = useRef();
+  const handleFiles = e => {
+    Array.from(e.target.files).forEach(f => {
+      const r = new FileReader();
+      r.onload = ev => onChange([...fotos, { name: f.name, data: ev.target.result }]);
+      r.readAsDataURL(f);
+    });
+  };
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <label style={S.label}>📷 Fotos</label>
+      <div onClick={() => ref.current.click()} style={{
+        border: "2px dashed #cbd5e1", borderRadius: 10, padding: "18px 12px",
+        textAlign: "center", cursor: "pointer", background: "#f8fafc", color: "#64748b", fontSize: 14
+      }}>Toca para añadir fotos</div>
+      <input ref={ref} type="file" accept="image/*" multiple capture="environment"
+        style={{ display: "none" }} onChange={handleFiles} />
+      {fotos.length > 0 && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 10 }}>
+          {fotos.map((f, i) => (
+            <div key={i} style={{ position: "relative" }}>
+              <img src={f.url || f.data} alt={f.name}
+                style={{ width: 80, height: 80, objectFit: "cover", borderRadius: 8, border: "1px solid #e2e8f0" }} />
+              <button onClick={() => onChange(fotos.filter((_, j) => j !== i))} style={{
+                position: "absolute", top: -6, right: -6, background: "#dc2626", color: "#fff",
+                border: "none", borderRadius: "50%", width: 20, height: 20, fontSize: 12, cursor: "pointer"
+              }}>✕</button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NotaForm({ config, onConfig, onSave, onCancel }) {
+  const [nota, setNota] = useState(emptyNota("montaje"));
+  const [saving, setSaving] = useState(false);
+  const set = (k, v) => setNota(n => ({ ...n, [k]: v }));
+  const addCfg = (field, val) => onConfig(c => ({ ...c, [field]: [...c[field], val] }));
+
+  const handleSave = async () => {
+    if (!nota.cliente.trim()) { alert("Por favor indica el nombre del cliente."); return; }
+    setSaving(true);
+    try {
+      await onSave(nota);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div style={S.card}>
+      <div style={{ display: "flex", gap: 8, marginBottom: 20, flexWrap: "wrap" }}>
+        {Object.entries(TIPO_NOTA).map(([k, v]) => (
+          <button key={k} onClick={() => set("tipo", k)} style={{
+            padding: "8px 14px", borderRadius: 8, border: "2px solid",
+            borderColor: nota.tipo === k ? v.color : "#e2e8f0",
+            background: nota.tipo === k ? v.color+"18" : "#fff",
+            color: nota.tipo === k ? v.color : "#64748b",
+            fontWeight: 700, fontSize: 13, cursor: "pointer"
+          }}>{v.label}</button>
+        ))}
+      </div>
+
+      <div style={S.row2}>
+        <div>
+          <label style={S.label}>📅 Fecha</label>
+          <input type="date" value={nota.fecha} onChange={e => set("fecha", e.target.value)} style={S.input} />
+        </div>
+        <div>
+          <label style={S.label}>🔢 Nº Visita</label>
+          <input type="number" min="1" value={nota.visita} onChange={e => set("visita", e.target.value)} style={S.input} />
+        </div>
+      </div>
+
+      <label style={S.label}>👤 Cliente / Proyecto</label>
+      <input placeholder="Nombre del cliente…" value={nota.cliente}
+        onChange={e => set("cliente", e.target.value)} style={{ ...S.input, marginBottom: 12 }} />
+
+      <label style={S.label}>📍 Dirección</label>
+      <input placeholder="Calle, número, piso…" value={nota.direccion}
+        onChange={e => set("direccion", e.target.value)} style={{ ...S.input, marginBottom: 12 }} />
+
+      <div style={{ height: 1, background: "#e2e8f0", margin: "16px 0" }} />
+      <p style={{ fontWeight: 700, fontSize: 13, color: "#475569", margin: "0 0 10px", textTransform: "uppercase", letterSpacing: 1 }}>👷 Equipo</p>
+
+      <SelectField label="Montador principal" value={nota.montador} onChange={v => set("montador", v)}
+        options={config.montadores} onAddNew={v => addCfg("montadores", v)} />
+      <SelectField label="Ayudante" value={nota.ayudante} onChange={v => set("ayudante", v)}
+        options={config.ayudantes} onAddNew={v => addCfg("ayudantes", v)} />
+      <SelectField label="Medidor" value={nota.medidor} onChange={v => set("medidor", v)}
+        options={config.medidores} onAddNew={v => addCfg("medidores", v)} />
+      <SelectField label="Diseñadora / P.M." value={nota.disenadora} onChange={v => set("disenadora", v)}
+        options={config.disenadoras} onAddNew={v => addCfg("disenadoras", v)} />
+
+      <div style={{ height: 1, background: "#e2e8f0", margin: "16px 0" }} />
+
+      <label style={S.label}>{nota.tipo === "postventa" ? "🛠 Descripción del fallo" : "📦 Material"}</label>
+      <textarea placeholder="Describe los materiales o el problema…" value={nota.materiales}
+        onChange={e => set("materiales", e.target.value)} rows={4}
+        style={{ ...S.input, resize: "vertical", marginBottom: 12 }} />
+
+      <label style={S.label}>📝 Observaciones</label>
+      <textarea placeholder="Trabajo pendiente, notas del cliente…" value={nota.observaciones}
+        onChange={e => set("observaciones", e.target.value)} rows={3}
+        style={{ ...S.input, resize: "vertical", marginBottom: 12 }} />
+
+      <FotoUpload fotos={nota.fotos} onChange={v => set("fotos", v)} />
+
+      <div style={{ display: "flex", gap: 10, marginTop: 8 }}>
+        <button onClick={handleSave} disabled={saving} style={{ ...S.btnPrimary, opacity: saving ? 0.7 : 1 }}>
+          {saving ? "⏳ Guardando…" : "💾 Guardar Nota"}
+        </button>
+        <button onClick={onCancel} style={S.btnSec}>Cancelar</button>
+      </div>
+    </div>
+  );
+}
+
+function NotaDetail({ nota, onBack, onDelete, deleting }) {
+  return (
+    <div style={S.card}>
+      <button onClick={onBack} style={{ ...S.btnSec, marginBottom: 16 }}>← Volver</button>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
+        <div>
+          <Badge tipo={nota.tipo} />
+          <h2 style={{ margin: "8px 0 4px", fontSize: 20, color: "#0f172a" }}>{nota.cliente || "Sin nombre"}</h2>
+          <p style={{ margin: 0, color: "#64748b", fontSize: 14 }}>{nota.direccion}</p>
+        </div>
+        <div style={{ textAlign: "right", color: "#94a3b8", fontSize: 13 }}>
+          <div>{nota.fecha}</div><div>Visita #{nota.visita}</div>
+        </div>
+      </div>
+
+      <div style={{ background: "#f8fafc", borderRadius: 10, padding: "12px 14px", marginBottom: 16 }}>
+        {[["Montador", nota.montador], ["Ayudante", nota.ayudante],
+          ["Medidor", nota.medidor], ["Diseñadora", nota.disenadora]].map(([l, v]) =>
+          v ? (
+            <div key={l} style={{ display: "flex", justifyContent: "space-between",
+              padding: "4px 0", borderBottom: "1px solid #e2e8f0", fontSize: 14 }}>
+              <span style={{ color: "#64748b" }}>{l}</span>
+              <span style={{ fontWeight: 600, color: "#1e293b" }}>{v}</span>
+            </div>
+          ) : null
+        )}
+      </div>
+
+      {nota.materiales && (
+        <div style={{ marginBottom: 14 }}>
+          <p style={{ fontWeight: 700, fontSize: 13, color: "#475569", margin: "0 0 6px", textTransform: "uppercase" }}>
+            {nota.tipo === "postventa" ? "Defecto/Fallo" : "Material"}
+          </p>
+          <p style={{ margin: 0, fontSize: 14, color: "#334155", lineHeight: 1.6, whiteSpace: "pre-wrap" }}>{nota.materiales}</p>
+        </div>
+      )}
+      {nota.observaciones && (
+        <div style={{ marginBottom: 14 }}>
+          <p style={{ fontWeight: 700, fontSize: 13, color: "#475569", margin: "0 0 6px", textTransform: "uppercase" }}>Observaciones</p>
+          <p style={{ margin: 0, fontSize: 14, color: "#334155", lineHeight: 1.6, whiteSpace: "pre-wrap" }}>{nota.observaciones}</p>
+        </div>
+      )}
+
+      {nota.fotos?.length > 0 && (
+        <div style={{ marginTop: 16 }}>
+          <p style={{ fontWeight: 700, fontSize: 13, color: "#475569", marginBottom: 8 }}>📷 Fotos ({nota.fotos.length})</p>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+            {nota.fotos.map((f, i) => (
+              <img key={i} src={f.url || f.data} alt={f.name}
+                style={{ width: "calc(50% - 4px)", borderRadius: 10, objectFit: "cover", aspectRatio: "1", border: "1px solid #e2e8f0" }} />
+            ))}
+          </div>
+        </div>
+      )}
+
+      <button onClick={() => { if (confirm("¿Eliminar esta nota?")) onDelete(nota.id); }}
+        disabled={deleting}
+        style={{ ...S.btnDanger, marginTop: 24, opacity: deleting ? 0.6 : 1 }}>
+        {deleting ? "⏳ Eliminando…" : "🗑 Eliminar nota"}
+      </button>
+    </div>
+  );
+}
+
+function ConfigPanel({ config, onConfig, onClose }) {
+  const fields = [
+    { key: "montadores", label: "👷 Montadores" },
+    { key: "ayudantes",  label: "🙋 Ayudantes" },
+    { key: "medidores",  label: "📐 Medidores" },
+    { key: "disenadoras",label: "🎨 Diseñadoras/PM" },
+  ];
+  const [nv, setNv] = useState({});
+  const remove = (f, v) => onConfig(c => ({ ...c, [f]: c[f].filter(x => x !== v) }));
+  const add = f => {
+    const v = (nv[f] || "").trim();
+    if (v && !config[f].includes(v)) onConfig(c => ({ ...c, [f]: [...c[f], v] }));
+    setNv(n => ({ ...n, [f]: "" }));
+  };
+  return (
+    <div style={S.card}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+        <h2 style={{ margin: 0, fontSize: 18, color: "#0f172a" }}>⚙️ Equipo</h2>
+        <button onClick={onClose} style={S.btnSec}>✕ Cerrar</button>
+      </div>
+      {fields.map(({ key, label }) => (
+        <div key={key} style={{ marginBottom: 20 }}>
+          <p style={{ fontWeight: 700, fontSize: 14, margin: "0 0 8px", color: "#334155" }}>{label}</p>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
+            {config[key].map(name => (
+              <span key={name} style={{ background: "#f1f5f9", borderRadius: 20, padding: "4px 10px",
+                fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}>
+                {name}
+                <span onClick={() => remove(key, name)} style={{ cursor: "pointer", color: "#dc2626", fontSize: 14 }}>✕</span>
+              </span>
+            ))}
+          </div>
+          <div style={{ display: "flex", gap: 6 }}>
+            <input placeholder="Añadir…" value={nv[key] || ""}
+              onChange={e => setNv(n => ({ ...n, [key]: e.target.value }))}
+              onKeyDown={e => e.key === "Enter" && add(key)}
+              style={{ ...S.input, flex: 1 }} />
+            <button style={S.btnSm} onClick={() => add(key)}>＋</button>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ─── APP ──────────────────────────────────────────────────────────────────────
+function App() {
+  const [notas, setNotas]     = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError]     = useState(null);
+  const [config, setConfig, hydrateConfig] = useServerConfig();
+  const [view, setView]       = useState("list");
+  const [selected, setSel]    = useState(null);
+  const [filter, setFilter]   = useState("all");
+  const [search, setSearch]   = useState("");
+  const [deleting, setDel]    = useState(false);
+
+  const load = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const { notas, config: serverCfg } = await fetchData();
+      setNotas(notas);
+      if (serverCfg && Object.keys(serverCfg).some(k => (serverCfg[k] || []).length)) {
+        hydrateConfig(serverCfg);
+      }
+    } catch (e) {
+      setError("No se pudo conectar. Comprueba que el script está publicado correctamente.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const saveNota = async (nota) => {
+    try {
+      let notaToSave = { ...nota };
+      if (notaToSave.fotos?.some(f => f.data && !f.url)) {
+        notaToSave.fotos = await uploadFotos(notaToSave);
+      }
+      await appendNota(notaToSave);
+      setNotas(n => [notaToSave, ...n]);
+      setView("list");
+    } catch (err) {
+      alert("No se pudo guardar la nota. Comprueba tu conexión e inténtalo de nuevo.\n\n" + err.message);
+    }
+  };
+
+  const handleDelete = async (id) => {
+    setDel(true);
+    try {
+      await deleteNota(id);
+      setNotas(n => n.filter(x => String(x.id) !== String(id)));
+      setView("list");
+    } catch (err) {
+      alert("No se pudo eliminar la nota. Comprueba tu conexión e inténtalo de nuevo.\n\n" + err.message);
+    } finally {
+      setDel(false);
+    }
+  };
+
+  const filtered = notas.filter(n =>
+    (filter === "all" || n.tipo === filter) &&
+    (n.cliente.toLowerCase().includes(search.toLowerCase()) ||
+     n.direccion.toLowerCase().includes(search.toLowerCase()))
+  );
+
+  return (
+    <div style={{
+      minHeight: "100vh",
+      background: "linear-gradient(160deg,#0f172a 0%,#1e3a5f 50%,#0f172a 100%)",
+      fontFamily: "'Segoe UI',system-ui,sans-serif",
+      paddingBottom: 80
+    }}>
+      {/* HEADER */}
+      <div style={{
+        background: "rgba(255,255,255,0.04)", backdropFilter: "blur(12px)",
+        borderBottom: "1px solid rgba(255,255,255,0.1)",
+        padding: "16px 16px 12px", position: "sticky", top: 0, zIndex: 10
+      }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <svg width="110" height="38" viewBox="0 0 110 38" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <text x="0" y="20" fontFamily="Georgia,serif" fontSize="15" fontWeight="300" fill="white" letterSpacing="1">línea</text>
+            <text x="0" y="34" fontFamily="Georgia,serif" fontSize="11" fontWeight="300" fill="white" letterSpacing="1.5">cocinas</text>
+            <rect x="60" y="2" width="48" height="34" rx="8" ry="8" fill="white"/>
+            <text x="68" y="26" fontFamily="Georgia,serif" fontSize="22" fontWeight="400" fill="black">3</text>
+            <line x1="88" y1="13" x2="104" y2="13" stroke="black" strokeWidth="2.5" strokeLinecap="round"/>
+            <line x1="88" y1="20" x2="104" y2="20" stroke="black" strokeWidth="2.5" strokeLinecap="round"/>
+            <line x1="88" y1="27" x2="104" y2="27" stroke="black" strokeWidth="2.5" strokeLinecap="round"/>
+          </svg>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <button onClick={load} style={S.btnIcon} title="Actualizar">🔄</button>
+            <button onClick={() => setView("config")} style={S.btnIcon}>⚙️</button>
+            <button onClick={() => setView("new")} style={{
+              background: "linear-gradient(135deg,#2563eb,#0ea5e9)",
+              color: "#fff", border: "none", borderRadius: 10,
+              padding: "8px 16px", fontWeight: 700, fontSize: 14, cursor: "pointer",
+              boxShadow: "0 4px 14px rgba(37,99,235,0.4)"
+            }}>＋ Nueva</button>
+          </div>
+        </div>
+      </div>
+
+      <div style={{ padding: 16, maxWidth: 600, margin: "0 auto" }}>
+        {view === "config" && (
+          <ConfigPanel config={config} onConfig={setConfig} onClose={() => setView("list")} />
+        )}
+        {view === "new" && (
+          <NotaForm config={config} onConfig={setConfig} onSave={saveNota} onCancel={() => setView("list")} />
+        )}
+        {view === "detail" && selected && (
+          <NotaDetail nota={selected} onBack={() => setView("list")} onDelete={handleDelete} deleting={deleting} />
+        )}
+
+        {view === "list" && (
+          <>
+            {error && (
+              <div style={{ background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 10,
+                padding: "12px 16px", marginBottom: 16, color: "#dc2626", fontSize: 14 }}>
+                ⚠️ {error}
+              </div>
+            )}
+
+            <input placeholder="🔍 Buscar cliente o dirección…" value={search}
+              onChange={e => setSearch(e.target.value)}
+              style={{ ...S.input, background: "rgba(255,255,255,0.08)", color: "#fff",
+                border: "1px solid rgba(255,255,255,0.15)", marginBottom: 12 }} />
+
+            <div style={{ display: "flex", gap: 6, marginBottom: 16, overflowX: "auto", paddingBottom: 4 }}>
+              {[["all", "Todas"], ...Object.entries(TIPO_NOTA).map(([k, v]) => [k, v.label])].map(([k, label]) => (
+                <button key={k} onClick={() => setFilter(k)} style={{
+                  flexShrink: 0, padding: "6px 14px", borderRadius: 20, border: "1px solid",
+                  borderColor: filter === k ? "#2563eb" : "rgba(255,255,255,0.15)",
+                  background: filter === k ? "#2563eb" : "rgba(255,255,255,0.06)",
+                  color: filter === k ? "#fff" : "#94a3b8",
+                  fontSize: 13, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap"
+                }}>{label}</button>
+              ))}
+            </div>
+
+            {loading ? (
+              <div style={{ textAlign: "center", padding: "60px 20px", color: "#94a3b8" }}>
+                <div style={{ fontSize: 36, marginBottom: 12 }}>⏳</div>
+                <div>Cargando notas…</div>
+              </div>
+            ) : filtered.length === 0 ? (
+              <div style={{ textAlign: "center", padding: "60px 20px", color: "#475569" }}>
+                <div style={{ fontSize: 48, marginBottom: 12 }}>📋</div>
+                <div style={{ fontSize: 16, fontWeight: 600, color: "#94a3b8" }}>No hay notas todavía</div>
+                <div style={{ fontSize: 14, marginTop: 6 }}>Pulsa "＋ Nueva" para crear la primera</div>
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {filtered.map(nota => {
+                  const t = TIPO_NOTA[nota.tipo];
+                  return (
+                    <div key={nota.id} onClick={() => { setSel(nota); setView("detail"); }}
+                      style={{
+                        background: "rgba(255,255,255,0.06)", backdropFilter: "blur(10px)",
+                        border: "1px solid rgba(255,255,255,0.1)",
+                        borderLeft: `4px solid ${t.color}`,
+                        borderRadius: 12, padding: "14px 16px", cursor: "pointer",
+                        display: "flex", justifyContent: "space-between", alignItems: "flex-start"
+                      }}>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                          <Badge tipo={nota.tipo} />
+                          {nota.fotos?.length > 0 && (
+                            <span style={{ fontSize: 12, color: "#94a3b8" }}>📷 {nota.fotos.length}</span>
+                          )}
+                        </div>
+                        <div style={{ color: "#f1f5f9", fontWeight: 700, fontSize: 16 }}>
+                          {nota.cliente || "Sin nombre"}
+                        </div>
+                        <div style={{ color: "#94a3b8", fontSize: 13, marginTop: 2 }}>{nota.direccion}</div>
+                        {(nota.montador || nota.ayudante) && (
+                          <div style={{ color: "#64748b", fontSize: 12, marginTop: 4 }}>
+                            👷 {[nota.montador, nota.ayudante].filter(Boolean).join(" + ")}
+                          </div>
+                        )}
+                      </div>
+                      <div style={{ textAlign: "right", color: "#64748b", fontSize: 12, flexShrink: 0, marginLeft: 10 }}>
+                        <div>{nota.fecha}</div>
+                        <div style={{ marginTop: 2 }}>V.{nota.visita}</div>
+                        <div style={{ marginTop: 6, color: "#475569", fontSize: 18 }}>›</div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {notas.length > 0 && (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 8, marginTop: 20 }}>
+                {Object.entries(TIPO_NOTA).map(([k, v]) => (
+                  <div key={k} style={{
+                    background: "rgba(255,255,255,0.04)", borderRadius: 10,
+                    padding: "12px 8px", textAlign: "center", border: `1px solid ${v.color}33`
+                  }}>
+                    <div style={{ fontSize: 22, fontWeight: 800, color: v.color }}>
+                      {notas.filter(n => n.tipo === k).length}
+                    </div>
+                    <div style={{ fontSize: 11, color: "#64748b", marginTop: 2 }}>
+                      {v.label.split(" ").slice(1).join(" ")}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const S = {
+  card:  { background: "#fff", borderRadius: 16, padding: 20, boxShadow: "0 8px 32px rgba(0,0,0,0.25)" },
+  label: { display: "block", fontSize: 13, fontWeight: 600, color: "#475569", marginBottom: 4 },
+  input: { width: "100%", boxSizing: "border-box", padding: "10px 12px", borderRadius: 8,
+           border: "1px solid #e2e8f0", fontSize: 14, background: "#fff", color: "#1e293b",
+           outline: "none", fontFamily: "inherit" },
+  row2:  { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 12 },
+  btnPrimary: { flex: 1, background: "linear-gradient(135deg,#2563eb,#0ea5e9)", color: "#fff",
+                border: "none", borderRadius: 10, padding: "12px 16px", fontWeight: 700, fontSize: 15, cursor: "pointer" },
+  btnSec:     { background: "#f1f5f9", color: "#475569", border: "1px solid #e2e8f0",
+                borderRadius: 8, padding: "10px 14px", fontWeight: 600, fontSize: 13, cursor: "pointer" },
+  btnDanger:  { width: "100%", background: "#fff5f5", color: "#dc2626", border: "1px solid #fecaca",
+                borderRadius: 10, padding: 12, fontWeight: 600, fontSize: 14, cursor: "pointer" },
+  btnSm:      { background: "#f1f5f9", color: "#475569", border: "1px solid #e2e8f0", borderRadius: 8,
+                padding: "0 12px", fontSize: 18, cursor: "pointer", minWidth: 38, height: 38,
+                display: "flex", alignItems: "center", justifyContent: "center" },
+  btnIcon:    { background: "rgba(255,255,255,0.08)", color: "#94a3b8", border: "1px solid rgba(255,255,255,0.15)",
+                borderRadius: 8, width: 38, height: 38, fontSize: 18, cursor: "pointer",
+                display: "flex", alignItems: "center", justifyContent: "center" },
+};
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
