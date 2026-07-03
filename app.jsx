@@ -1,4 +1,4 @@
-const { useState, useEffect, useRef } = React;
+import { useState, useEffect, useRef } from "react";
 
 const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxRH29fg7I_RCAU9VBakZP1jXj0P9JQkUd8EduRd4TqQiYvlddFXr-J1Cbe4nmUugYN/exec";
 
@@ -112,16 +112,20 @@ function useServerConfig() {
     catch { return INITIAL_CONFIG; }
   });
 
+  // Solo actualiza el estado local + caché, sin reenviar al servidor (para cuando llegan datos del servidor)
   const hydrate = (serverCfg) => {
     setCfgState(serverCfg);
     localStorage.setItem("l3_config_cache", JSON.stringify(serverCfg));
   };
 
+  // Actualiza el estado local + caché + envía el cambio al servidor (para cambios del usuario)
   const update = (updater) => {
     setCfgState(prev => {
       const next = typeof updater === "function" ? updater(prev) : updater;
       localStorage.setItem("l3_config_cache", JSON.stringify(next));
-      saveConfigToServer(next).catch(() => {});
+      saveConfigToServer(next).catch(() => {
+        // Si falla el guardado remoto, el cambio queda en local; se reintentará en el próximo cambio
+      });
       return next;
     });
   };
@@ -413,7 +417,7 @@ function ConfigPanel({ config, onConfig, onClose }) {
 }
 
 // ─── APP ──────────────────────────────────────────────────────────────────────
-function App() {
+export default function App() {
   const [notas, setNotas]     = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError]     = useState(null);
@@ -644,6 +648,3 @@ const S = {
                 borderRadius: 8, width: 38, height: 38, fontSize: 18, cursor: "pointer",
                 display: "flex", alignItems: "center", justifyContent: "center" },
 };
-
-const root = ReactDOM.createRoot(document.getElementById("root"));
-root.render(<App />);
